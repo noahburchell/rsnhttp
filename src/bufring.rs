@@ -7,7 +7,8 @@ use io_uring::types::BufRingEntry;
 
 pub const GROUP: u16 = 0;
 pub const BUF_LEN: usize = 4096;
-const ENTRIES: u16 = 256;
+// a batch of completions with more receives than this retries the rest with ENOBUFS
+const ENTRIES: u16 = 1024;
 
 pub struct BufRing {
     ring: *mut BufRingEntry,

@@ -31,17 +31,14 @@ pub type Error = (&'static str, io::Error);
 enum State {
     Recv,
     Open,
-    Stat,
     Read,
     Send,
 }
 
 // exactly one operation is in flight per connection, state names it
 struct Conn {
-    fd: i32,
     file: i32,
     buf: u32,
-    last: u32,
     state: State,
     head: bool,
     keep: bool,
@@ -56,16 +53,13 @@ struct Conn {
     since: Stamp,
     if_range: Stamp,
     pending: Vec<u8>,
-    stx: libc::statx,
 }
 
 impl Conn {
-    fn new(fd: i32, tick: u32) -> Conn {
+    const fn new() -> Conn {
         Conn {
-            fd,
             file: -1,
             buf: NONE,
-            last: tick,
             state: State::Recv,
             head: false,
             keep: false,
@@ -80,9 +74,16 @@ impl Conn {
             since: [0; http::STAMP_LEN],
             if_range: [0; http::STAMP_LEN],
             pending: Vec::new(),
-            stx: unsafe { mem::zeroed() },
         }
     }
+}
+
+// kept apart from Conn, the idle scan reads 8 bytes per connection
+// fd is -1 when the slot is free
+#[derive(Clone, Copy)]
+struct Slot {
+    fd: i32,
+    last: u32,
 }
 
 struct Server<'r> {
@@ -90,9 +91,8 @@ struct Server<'r> {
     sq: SubmissionQueue<'r>,
     backlog: Vec<squeue::Entry>,
     recv: BufRing,
-    // boxed so that the statx buffer keeps its address when the vector grows
-    #[allow(clippy::vec_box)]
-    conns: Vec<Box<Conn>>,
+    conns: Vec<Conn>,
+    slots: Vec<Slot>,
     free: Vec<u32>,
     bufs: Vec<Box<[u8]>>,
     free_bufs: Vec<u32>,
@@ -124,6 +124,13 @@ fn open_error(errno: i32) -> (&'static [u8], bool) {
     }
 }
 
+fn close_entry(fd: i32) -> squeue::Entry {
+    opcode::Close::new(types::Fd(fd))
+        .build()
+        .flags(squeue::Flags::SKIP_SUCCESS)
+        .user_data(IGNORE)
+}
+
 pub fn serve(listener: i32, root: i32) -> Result<(), Error> {
     let mut ring: IoUring = IoUring::builder()
         .setup_single_issuer()
@@ -139,6 +146,7 @@ pub fn serve(listener: i32, root: i32) -> Result<(), Error> {
         backlog: Vec::new(),
         recv,
         conns: Vec::new(),
+        slots: Vec::new(),
         free: Vec::new(),
         bufs: Vec::new(),
         free_bufs: Vec::new(),
@@ -160,14 +168,23 @@ impl Server<'_> {
             self.flush_backlog();
             match self.submitter.submit_and_wait(1) {
                 Ok(_) => {}
-                Err(e) if matches!(e.raw_os_error(), Some(libc::EINTR | libc::EBUSY)) => {}
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::EINTR | libc::EBUSY | libc::EAGAIN)
+                    ) => {}
                 Err(e) => return Err(e),
             }
 
+            // without the head the kernel advanced the queue looks full to push
+            self.sq.sync();
             cq.sync();
             for cqe in cq.by_ref() {
                 self.complete(cqe.user_data(), cqe.result(), cqe.flags());
             }
+
+            // publishes the head, the kernel does not wait while it sees unread completions
+            cq.sync();
         }
     }
 
@@ -192,7 +209,7 @@ impl Server<'_> {
     }
 
     fn push(&mut self, e: squeue::Entry) {
-        // entries point into conns, bufs and statics, all of which outlive the completion
+        // entries point into bufs and statics, both outlive the completion
         if unsafe { self.sq.push(&e) }.is_err() {
             self.backlog.push(e);
         }
@@ -216,9 +233,8 @@ impl Server<'_> {
     }
 
     fn arm_recv(&mut self, idx: usize) {
-        let c = &mut *self.conns[idx];
-        c.state = State::Recv;
-        let e = opcode::Recv::new(types::Fd(c.fd), std::ptr::null_mut(), 0)
+        self.conns[idx].state = State::Recv;
+        let e = opcode::Recv::new(types::Fd(self.slots[idx].fd), std::ptr::null_mut(), 0)
             .buf_group(bufring::GROUP)
             .build()
             .flags(squeue::Flags::BUFFER_SELECT)
@@ -257,14 +273,19 @@ impl Server<'_> {
     }
 
     fn open_conn(&mut self, fd: i32) {
-        let conn = Conn::new(fd, self.tick);
+        let slot = Slot {
+            fd,
+            last: self.tick,
+        };
         let idx = match self.free.pop() {
             Some(i) => {
-                *self.conns[i as usize] = conn;
+                self.conns[i as usize] = Conn::new();
+                self.slots[i as usize] = slot;
                 i as usize
             }
             None => {
-                self.conns.push(Box::new(conn));
+                self.conns.push(Conn::new());
+                self.slots.push(slot);
                 self.conns.len() - 1
             }
         };
@@ -281,9 +302,9 @@ impl Server<'_> {
         }
 
         // shutdown completes the pending operation with an error, which closes the connection
-        for c in &self.conns {
-            if c.fd >= 0 && self.tick.wrapping_sub(c.last) > IDLE_TICKS {
-                unsafe { libc::shutdown(c.fd, libc::SHUT_RDWR) };
+        for s in &self.slots {
+            if s.fd >= 0 && self.tick.wrapping_sub(s.last) > IDLE_TICKS {
+                unsafe { libc::shutdown(s.fd, libc::SHUT_RDWR) };
             }
         }
 
@@ -293,12 +314,10 @@ impl Server<'_> {
     }
 
     fn on_conn(&mut self, idx: usize, res: i32, flags: u32) {
-        let c = &mut *self.conns[idx];
-        c.last = self.tick;
-        match c.state {
+        self.slots[idx].last = self.tick;
+        match self.conns[idx].state {
             State::Recv => self.on_recv(idx, res, flags),
             State::Open => self.on_open(idx, res),
-            State::Stat => self.on_stat(idx, res),
             State::Read => self.on_read(idx, res),
             State::Send => self.on_send(idx, res),
         }
@@ -328,7 +347,7 @@ impl Server<'_> {
     }
 
     fn on_data(&mut self, idx: usize, data: &[u8]) {
-        let c = &mut *self.conns[idx];
+        let c = &mut self.conns[idx];
         if !c.pending.is_empty() {
             c.pending.extend_from_slice(data);
             return self.next_request(idx);
@@ -384,7 +403,7 @@ impl Server<'_> {
         };
 
         let buf = self.take_buf();
-        let c = &mut *self.conns[idx];
+        let c = &mut self.conns[idx];
         c.buf = buf;
         c.head = req.head;
         c.keep = req.keep;
@@ -411,31 +430,22 @@ impl Server<'_> {
             return self.reply(idx, resp, keep);
         }
 
-        let c = &mut *self.conns[idx];
+        let c = &mut self.conns[idx];
         c.file = res;
-        c.state = State::Stat;
-        let e = opcode::Statx::new(types::Fd(res), c"".as_ptr(), (&raw mut c.stx).cast())
-            .flags(libc::AT_EMPTY_PATH)
-            .mask(libc::STATX_TYPE | libc::STATX_SIZE | libc::STATX_MTIME)
-            .build()
-            .user_data(idx as u64);
-        self.push(e);
-    }
-
-    fn on_stat(&mut self, idx: usize, res: i32) {
-        if res < 0 {
+        // the open loaded the inode, fstat answers from memory without a trip through io-wq
+        let mut st: libc::stat = unsafe { mem::zeroed() };
+        if unsafe { libc::fstat(res, &mut st) } < 0 {
             return self.reply(idx, http::R500, false);
         }
 
-        let c = &mut *self.conns[idx];
-        match c.stx.stx_mode as u32 & libc::S_IFMT {
+        match st.st_mode & libc::S_IFMT {
             libc::S_IFREG => {}
             libc::S_IFDIR => return self.redirect(idx),
             _ => return self.reply(idx, http::R403, true),
         }
 
-        let size = c.stx.stx_size;
-        let modified = http::stamp(c.stx.stx_mtime.tv_sec);
+        let size = st.st_size as u64;
+        let modified = http::stamp(st.st_mtime);
         let meta = Meta {
             date: &self.date,
             modified: &modified,
@@ -469,7 +479,7 @@ impl Server<'_> {
     }
 
     fn redirect(&mut self, idx: usize) {
-        let c = &mut *self.conns[idx];
+        let c = &mut self.conns[idx];
         let (out, path) = self.bufs[c.buf as usize].split_at_mut(PATH_AT);
         let n = http::head_301(out, &self.date, &path[..c.path_len as usize], c.keep);
         c.remaining = 0;
@@ -479,7 +489,7 @@ impl Server<'_> {
 
     // reads the next part of the file behind fill bytes of response header
     fn read_file(&mut self, idx: usize, fill: usize) {
-        let c = &mut *self.conns[idx];
+        let c = &mut self.conns[idx];
         let len = c.remaining.min((BUF - fill) as u64) as u32;
         c.fill = fill as u32;
         c.state = State::Read;
@@ -497,7 +507,7 @@ impl Server<'_> {
             return self.close(idx);
         }
 
-        let c = &mut *self.conns[idx];
+        let c = &mut self.conns[idx];
         c.remaining -= res as u64;
         c.offset += res as u64;
         let ptr = self.bufs[c.buf as usize].as_ptr();
@@ -506,11 +516,11 @@ impl Server<'_> {
     }
 
     fn send(&mut self, idx: usize, ptr: *const u8, len: usize) {
-        let c = &mut *self.conns[idx];
+        let c = &mut self.conns[idx];
         c.send_ptr = ptr;
         c.send_len = len as u32;
         c.state = State::Send;
-        let e = opcode::Send::new(types::Fd(c.fd), ptr, len as u32)
+        let e = opcode::Send::new(types::Fd(self.slots[idx].fd), ptr, len as u32)
             .flags(libc::MSG_NOSIGNAL | libc::MSG_WAITALL)
             .build()
             .user_data(idx as u64);
@@ -519,7 +529,7 @@ impl Server<'_> {
 
     fn reply(&mut self, idx: usize, resp: &'static [u8], keep: bool) {
         self.release(idx);
-        let c = &mut *self.conns[idx];
+        let c = &mut self.conns[idx];
         c.keep &= keep;
         c.remaining = 0;
         self.send(idx, resp.as_ptr(), resp.len());
@@ -530,7 +540,7 @@ impl Server<'_> {
             return self.close(idx);
         }
 
-        let c = &mut *self.conns[idx];
+        let c = &mut self.conns[idx];
         let sent = res as u32;
         if sent < c.send_len {
             let ptr = unsafe { c.send_ptr.add(sent as usize) };
@@ -543,7 +553,7 @@ impl Server<'_> {
         }
 
         self.release(idx);
-        let c = &mut *self.conns[idx];
+        let c = &mut self.conns[idx];
         if !c.keep {
             return self.close(idx);
         }
@@ -556,7 +566,7 @@ impl Server<'_> {
     }
 
     fn release(&mut self, idx: usize) {
-        let c = &mut *self.conns[idx];
+        let c = &mut self.conns[idx];
         let file = mem::replace(&mut c.file, -1);
         let buf = mem::replace(&mut c.buf, NONE);
         if buf != NONE {
@@ -564,20 +574,15 @@ impl Server<'_> {
         }
 
         if file >= 0 {
-            self.push(
-                opcode::Close::new(types::Fd(file))
-                    .build()
-                    .user_data(IGNORE),
-            );
+            self.push(close_entry(file));
         }
     }
 
     fn close(&mut self, idx: usize) {
         self.release(idx);
-        let c = &mut *self.conns[idx];
-        let fd = mem::replace(&mut c.fd, -1);
-        c.pending = Vec::new();
+        self.conns[idx].pending = Vec::new();
+        let fd = mem::replace(&mut self.slots[idx].fd, -1);
         self.free.push(idx as u32);
-        self.push(opcode::Close::new(types::Fd(fd)).build().user_data(IGNORE));
+        self.push(close_entry(fd));
     }
 }

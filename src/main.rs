@@ -167,14 +167,28 @@ fn account() -> (libc::uid_t, libc::gid_t) {
     unsafe { ((*pw).pw_uid, (*pw).pw_gid) }
 }
 
+// root raises the hard limit as far as fs.nr_open, anyone else stops at the hard limit
 fn raise_nofile() {
+    let nr_open = std::fs::read_to_string("/proc/sys/fs/nr_open")
+        .ok()
+        .and_then(|s| s.trim_ascii().parse::<libc::rlim_t>().ok());
     unsafe {
         let mut lim: libc::rlimit = mem::zeroed();
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) < 0 {
             return;
         }
 
-        lim.rlim_cur = lim.rlim_max;
+        if let Some(n) = nr_open {
+            let raised = libc::rlimit {
+                rlim_cur: n,
+                rlim_max: n,
+            };
+            if n > lim.rlim_max && libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
+                return;
+            }
+        }
+
+        lim.rlim_cur = lim.rlim_max.min(nr_open.unwrap_or(libc::RLIM_INFINITY));
         libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
     }
 }
